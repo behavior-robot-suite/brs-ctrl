@@ -408,9 +408,16 @@ class R1Interface:
             else 0
         )
 
-        # control loop
-        max_n_steps = max(left_arm_n_steps, right_arm_n_steps, torso_n_steps)
-        if max_n_steps > 1:
+        # TORSO: Publish immediately without interpolation for responsive control
+        # This ensures holding the torso button results in continuous movement
+        if torso_target_q is not None:
+            torso_joint_state.header.stamp = rospy.Time.now()
+            torso_joint_state.position = torso_target_q.tolist()
+            self._torso_joint_target_position_pub.publish(torso_joint_state)
+
+        # ARMS: Use interpolation loop only for arms (torso already published above)
+        max_arm_n_steps = max(left_arm_n_steps, right_arm_n_steps)
+        if max_arm_n_steps > 1:
             if left_arm_target_q is not None:
                 left_arm_increment = (
                     (left_arm_target_q - np.array(left_arm_joint_state.position))
@@ -429,17 +436,8 @@ class R1Interface:
                 )
             else:
                 right_arm_increment = np.zeros(6)
-            if torso_target_q is not None:
-                torso_increment = (
-                    (torso_target_q - np.array(torso_joint_state.position))
-                    / (torso_n_steps - 1)
-                    if torso_n_steps > 1
-                    else (torso_target_q - np.array(torso_joint_state.position))
-                )
-            else:
-                torso_increment = np.zeros(4)
 
-            for step in range(max_n_steps - 1):
+            for step in range(max_arm_n_steps - 1):
                 if left_arm_target_q is not None:
                     left_arm_joint_state.header.stamp = rospy.Time.now()
                     if step <= left_arm_n_steps - 1:
@@ -463,18 +461,9 @@ class R1Interface:
                     self._right_arm_joint_target_position_pub.publish(
                         right_arm_joint_state
                     )
-                if torso_target_q is not None:
-                    torso_joint_state.header.stamp = rospy.Time.now()
-                    if step <= torso_n_steps - 1:
-                        torso_joint_state.position = (
-                            np.array(torso_joint_state.position) + torso_increment
-                        ).tolist()
-                    else:
-                        torso_joint_state.position = torso_target_q.tolist()
-                self._torso_joint_target_position_pub.publish(torso_joint_state)
                 self._rate.sleep()
 
-        # ensure the last position is the target position
+        # ensure exact final target positions for arms
         if left_arm_target_q is not None:
             left_arm_joint_state.header.stamp = rospy.Time.now()
             left_arm_joint_state.position = left_arm_target_q.tolist()
@@ -483,10 +472,6 @@ class R1Interface:
             right_arm_joint_state.header.stamp = rospy.Time.now()
             right_arm_joint_state.position = right_arm_target_q.tolist()
             self._right_arm_joint_target_position_pub.publish(right_arm_joint_state)
-        if torso_target_q is not None:
-            torso_joint_state.header.stamp = rospy.Time.now()
-            torso_joint_state.position = torso_target_q.tolist()
-            self._torso_joint_target_position_pub.publish(torso_joint_state)
         if not (
             left_arm_target_q is None
             and right_arm_target_q is None
@@ -750,12 +735,18 @@ class R1ProInterface(Node):
         # ====== torso ======
         torso_joint_state_topic: str = "/hdas/feedback_torso",
         torso_joint_target_position_topic: str = "/motion_target/target_joint_state_torso",
+        # ====== chassis ======
+        chassis_joint_state_topic: str = "/hdas/feedback_chassis",
         # ====== mobile base ======
         mobile_base_vel_cmd_topic: str = "/motion_target/target_speed_chassis",
         mobile_base_cmd_threshold: Union[np.ndarray, float] = np.array(
             [0.01, 0.01, 0.05]
         ),
         mobile_base_cmd_limit: Union[np.ndarray, float] = np.array([0.3, 0.3, 0.4]),
+        # ====== odometry ======
+        odometry_topic: str = "/camera/odom/sample",
+        T_odom2base: Optional[np.ndarray] = None,
+        wait_for_first_odom_msg: bool = False,
         # ====== cameras ======
         enable_rgb: bool = True,
         rgb_topics: Optional[Dict[str, str]] = None,
@@ -768,15 +759,18 @@ class R1ProInterface(Node):
         control_freq: float = 100.0,
         on_arm_cmd_out_of_range: Literal["raise", "clip"] = "clip",
         on_torso_cmd_out_of_range: Literal["raise", "clip"] = "clip",
+        log_clipping_warnings: bool = True,
     ):
         super().__init__(publisher_node_name)
         # Frequency for sleeps (wall clock; prefer timers for periodic callbacks)
         self._control_freq = float(control_freq)
         self._sleep_dt = 1.0 / self._control_freq
+        self._log_clipping_warnings = log_clipping_warnings
 
         self._left_arm_joint_state_buffer = None
         self._right_arm_joint_state_buffer = None
         self._torso_joint_state_buffer = None
+        self._chassis_joint_state_buffer = None
         self._state_buffer_size = state_buffer_size
         self._rgb = None
 
@@ -816,6 +810,9 @@ class R1ProInterface(Node):
         self._torso_joint_state_sub = self.create_subscription(
             JointState, torso_joint_state_topic, self._torso_state_callback, sens_qos
         )
+        self._chassis_joint_state_sub = self.create_subscription(
+            JointState, chassis_joint_state_topic, self._chassis_state_callback, sens_qos
+        )
 
         if enable_rgb:
             rgb_topics = rgb_topics or {
@@ -854,6 +851,16 @@ class R1ProInterface(Node):
         self._mobile_base_cmd_limit = mobile_base_cmd_limit
         self._mobile_base_vel_cmd_pub = self.create_publisher(
             TwistStamped, mobile_base_vel_cmd_topic, cmd_qos
+        )
+
+        # odometry
+        if T_odom2base is None:
+            T_odom2base = np.eye(4)  # Identity if no transform provided
+        self._odom = Odom(
+            self,  # ROS2 node
+            odom_topic=odometry_topic,
+            T_odom2base=T_odom2base,
+            wait_for_first_msg=wait_for_first_odom_msg,
         )
 
         self._left_gripper, self._right_gripper = left_gripper, right_gripper
@@ -965,19 +972,23 @@ class R1ProInterface(Node):
                 left_arm_target_q <= self.left_arm_joint_high,
             )
             for idx in np.where(~left_in_range)[0]:
-                msg = (
-                    f"Left arm joint {idx+1} target {left_arm_target_q[idx]} out of range "
-                    f"[{self.left_arm_joint_low[idx]}, {self.left_arm_joint_high[idx]}]."
-                )
                 if self._on_arm_cmd_out_of_range == "clip":
                     left_arm_target_q[idx] = np.clip(
                         left_arm_target_q[idx],
                         self.left_arm_joint_low[idx],
                         self.left_arm_joint_high[idx],
                     )
-                    msg += " Clipped."
-                    self.get_logger().warning(msg)
+                    if self._log_clipping_warnings:
+                        msg = (
+                            f"Left arm joint {idx+1} target {left_arm_target_q[idx]} out of range "
+                            f"[{self.left_arm_joint_low[idx]}, {self.left_arm_joint_high[idx]}]. Clipped."
+                        )
+                        self.get_logger().warning(msg)
                 else:
+                    msg = (
+                        f"Left arm joint {idx+1} target {left_arm_target_q[idx]} out of range "
+                        f"[{self.left_arm_joint_low[idx]}, {self.left_arm_joint_high[idx]}]."
+                    )
                     raise ValueError(msg)
 
         if right_arm_target_q is not None:
@@ -986,19 +997,23 @@ class R1ProInterface(Node):
                 right_arm_target_q <= self.right_arm_joint_high,
             )
             for idx in np.where(~right_in_range)[0]:
-                msg = (
-                    f"Right arm joint {idx+1} target {right_arm_target_q[idx]} out of range "
-                    f"[{self.right_arm_joint_low[idx]}, {self.right_arm_joint_high[idx]}]."
-                )
                 if self._on_arm_cmd_out_of_range == "clip":
                     right_arm_target_q[idx] = np.clip(
                         right_arm_target_q[idx],
                         self.right_arm_joint_low[idx],
                         self.right_arm_joint_high[idx],
                     )
-                    msg += " Clipped."
-                    self.get_logger().warning(msg)
+                    if self._log_clipping_warnings:
+                        msg = (
+                            f"Right arm joint {idx+1} target {right_arm_target_q[idx]} out of range "
+                            f"[{self.right_arm_joint_low[idx]}, {self.right_arm_joint_high[idx]}]. Clipped."
+                        )
+                        self.get_logger().warning(msg)
                 else:
+                    msg = (
+                        f"Right arm joint {idx+1} target {right_arm_target_q[idx]} out of range "
+                        f"[{self.right_arm_joint_low[idx]}, {self.right_arm_joint_high[idx]}]."
+                    )
                     raise ValueError(msg)
 
         if torso_target_q is not None:
@@ -1007,18 +1022,23 @@ class R1ProInterface(Node):
                 torso_target_q <= self.torso_joint_high,
             )
             for idx in np.where(~torso_in_range)[0]:
-                msg = (
-                    f"Torso joint {idx+1} target {torso_target_q[idx]} out of range "
-                    f"[{self.torso_joint_low[idx]}, {self.torso_joint_high[idx]}]."
-                )
                 if self._on_torso_cmd_out_of_range == "clip":
                     torso_target_q[idx] = np.clip(
                         torso_target_q[idx],
                         self.torso_joint_low[idx],
                         self.torso_joint_high[idx],
                     )
-                    self.get_logger().warning(msg)
+                    if self._log_clipping_warnings:
+                        msg = (
+                            f"Torso joint {idx+1} target {torso_target_q[idx]} out of range "
+                            f"[{self.torso_joint_low[idx]}, {self.torso_joint_high[idx]}]. Clipped."
+                        )
+                        self.get_logger().warning(msg)
                 else:
+                    msg = (
+                        f"Torso joint {idx+1} target {torso_target_q[idx]} out of range "
+                        f"[{self.torso_joint_low[idx]}, {self.torso_joint_high[idx]}]."
+                    )
                     raise ValueError(msg)
 
         # compute step counts
@@ -1083,9 +1103,16 @@ class R1ProInterface(Node):
             else 0
         )
 
-        # control loop
-        max_n_steps = max(left_arm_n_steps, right_arm_n_steps, torso_n_steps)
-        if max_n_steps > 1:
+        # TORSO: Publish immediately without interpolation for responsive control
+        # This ensures holding the torso button results in continuous movement
+        if torso_target_q is not None:
+            torso_joint_state.header.stamp = self._now_msg()
+            torso_joint_state.position = torso_target_q.tolist()
+            self._torso_joint_target_position_pub.publish(torso_joint_state)
+
+        # ARMS: Use interpolation loop only for arms (torso already published above)
+        max_arm_n_steps = max(left_arm_n_steps, right_arm_n_steps)
+        if max_arm_n_steps > 1:
             left_arm_increment = (
                 (
                     (left_arm_target_q - np.array(left_arm_joint_state.position))
@@ -1095,7 +1122,7 @@ class R1ProInterface(Node):
                 else (
                     (left_arm_target_q - np.array(left_arm_joint_state.position))
                     if left_arm_target_q is not None
-                    else np.zeros(6)
+                    else np.zeros(7)
                 )
             )
             right_arm_increment = (
@@ -1107,23 +1134,11 @@ class R1ProInterface(Node):
                 else (
                     (right_arm_target_q - np.array(right_arm_joint_state.position))
                     if right_arm_target_q is not None
-                    else np.zeros(6)
-                )
-            )
-            torso_increment = (
-                (
-                    (torso_target_q - np.array(torso_joint_state.position))
-                    / (torso_n_steps - 1)
-                )
-                if (torso_target_q is not None and torso_n_steps > 1)
-                else (
-                    (torso_target_q - np.array(torso_joint_state.position))
-                    if torso_target_q is not None
-                    else np.zeros(4)
+                    else np.zeros(7)
                 )
             )
 
-            for step in range(max_n_steps - 1):
+            for step in range(max_arm_n_steps - 1):
                 if left_arm_target_q is not None:
                     left_arm_joint_state.header.stamp = self._now_msg()
                     if step <= left_arm_n_steps - 1:
@@ -1149,19 +1164,9 @@ class R1ProInterface(Node):
                         right_arm_joint_state
                     )
 
-                if torso_target_q is not None:
-                    torso_joint_state.header.stamp = self._now_msg()
-                    if step <= torso_n_steps - 1:
-                        torso_joint_state.position = (
-                            np.array(torso_joint_state.position) + torso_increment
-                        ).tolist()
-                    else:
-                        torso_joint_state.position = torso_target_q.tolist()
-                    self._torso_joint_target_position_pub.publish(torso_joint_state)
-
                 self._sleep_tick()
 
-        # ensure exact final target positions
+        # ensure exact final target positions for arms
         if left_arm_target_q is not None:
             left_arm_joint_state.header.stamp = self._now_msg()
             left_arm_joint_state.position = left_arm_target_q.tolist()
@@ -1170,10 +1175,6 @@ class R1ProInterface(Node):
             right_arm_joint_state.header.stamp = self._now_msg()
             right_arm_joint_state.position = right_arm_target_q.tolist()
             self._right_arm_joint_target_position_pub.publish(right_arm_joint_state)
-        if torso_target_q is not None:
-            torso_joint_state.header.stamp = self._now_msg()
-            torso_joint_state.position = torso_target_q.tolist()
-            self._torso_joint_target_position_pub.publish(torso_joint_state)
 
         if not (
             left_arm_target_q is None
@@ -1277,6 +1278,26 @@ class R1ProInterface(Node):
                 self._torso_joint_state_buffer, np.s_[-self._state_buffer_size :]
             )
 
+    def _chassis_state_callback(self, data: JointState):
+        # Chassis feedback: position has 3 values, velocity has 6 values (use first 3)
+        new_state = {
+            "joint_position": np.array([data.position[:3]]),
+            "joint_velocity": np.array([data.velocity[:3]]),
+            "seq": np.array([data.header.stamp.nanosec]),
+            "stamp": np.array(
+                [data.header.stamp.sec + data.header.stamp.nanosec * 1e-9]
+            ),
+        }
+        if self._chassis_joint_state_buffer is None:
+            self._chassis_joint_state_buffer = new_state
+        else:
+            self._chassis_joint_state_buffer = U.any_concat(
+                [self._chassis_joint_state_buffer, new_state], dim=0
+            )
+            self._chassis_joint_state_buffer = U.any_slice(
+                self._chassis_joint_state_buffer, np.s_[-self._state_buffer_size :]
+            )
+
     # ---------- Lifecycle ----------
     def close(self):
         # stop the base
@@ -1327,6 +1348,35 @@ class R1ProInterface(Node):
         }
 
     @property
+    def last_chassis_position(self) -> Optional[np.ndarray]:
+        """Get the last chassis position (3 values) from /hdas/feedback_chassis."""
+        if self._chassis_joint_state_buffer is None:
+            return None
+        return U.any_slice(self._chassis_joint_state_buffer, -1)["joint_position"]
+
+    @property
+    def last_chassis_velocity(self) -> Optional[np.ndarray]:
+        """Get the last chassis velocity (first 3 of 6 values) from /hdas/feedback_chassis."""
+        if self._chassis_joint_state_buffer is None:
+            return None
+        return U.any_slice(self._chassis_joint_state_buffer, -1)["joint_velocity"]
+
+    @property
+    def last_joint_velocity(self) -> Optional[Dict[str, np.ndarray]]:
+        """Get the last joint velocities for all robot parts."""
+        if (
+            self._left_arm_joint_state_buffer is None
+            or self._right_arm_joint_state_buffer is None
+            or self._torso_joint_state_buffer is None
+        ):
+            return None
+        return {
+            "left_arm": U.any_slice(self._left_arm_joint_state_buffer, -1)["joint_velocity"],
+            "right_arm": U.any_slice(self._right_arm_joint_state_buffer, -1)["joint_velocity"],
+            "torso": U.any_slice(self._torso_joint_state_buffer, -1)["joint_velocity"],
+        }
+
+    @property
     def last_rgb(self):
         # Because v can be None
         if self._rgb is not None:
@@ -1343,3 +1393,19 @@ class R1ProInterface(Node):
             return return_dict
         else:
             return None
+
+    @property
+    def curr_base_pose(self):
+        return self._odom.curr_base_pose
+
+    @property
+    def curr_base_position(self):
+        return self._odom.curr_base_position
+
+    @property
+    def curr_base_orientation(self):
+        return self._odom.curr_base_orientation
+
+    @property
+    def curr_base_velocity(self):
+        return self._odom.curr_base_velocity

@@ -1,0 +1,31 @@
+joystick:
+  left:
+    horizontal:
+      center_range:
+      - 1968
+      - 1971
+      limits:
+      - 645
+      - 3337
+    vertical:
+      center_range:
+      - 2295
+      - 2300
+      limits:
+      - 1131
+      - 3402
+  right:
+    horizontal:
+      center_range:
+      - 2047
+      - 2051
+      limits:
+      - 696
+      - 3346
+    vertical:
+      center_range:
+      - 1808
+      - 1838
+      limits:
+      - 665
+      - 2918

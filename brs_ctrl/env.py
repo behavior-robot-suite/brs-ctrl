@@ -133,10 +133,15 @@ class R1ProEnv(gym.Env):
 
     def _spin_thread(self):
         # run executor until close() flips the flag
+        # Use shorter timeout for more responsive callback processing
         while self._spin and rclpy.ok():
-            self._executor.spin_once(timeout_sec=0.05)
+            self._executor.spin_once(timeout_sec=0.005)
 
     def step(self, action: Dict[str, np.ndarray]):
+        # Process any pending callbacks to ensure fresh state before control
+        # This ensures torso feedback is up-to-date for responsive control
+        self._executor.spin_once(timeout_sec=0)
+
         self.robot_interface.control(
             arm_cmd={
                 "left": action["action.left_arm_joints"],
@@ -152,6 +157,8 @@ class R1ProEnv(gym.Env):
         return self._get_observation(), 0.0, False, False, {}
 
     def reset(self, seed=None, options=None):
+        # Process pending callbacks to ensure fresh state
+        self._executor.spin_once(timeout_sec=0)
         obs = self._get_observation()
         return obs, {}
 
